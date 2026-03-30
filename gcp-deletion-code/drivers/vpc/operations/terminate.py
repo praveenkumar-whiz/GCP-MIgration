@@ -675,10 +675,105 @@ def terminate_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
                 logger.error("Subnetworks processing failed: %s", str(e), exc_info=True)
 
             # ========================================================
-            # STEP 10: Delete Networks (including default)
-            # Note: Deleting a network automatically deletes its routes and auto-mode subnetworks
+            # STEP 10: Delete Custom Routes (skip default routes)
+            # Note: Default routes are automatically managed by GCP and deleted with the network
+            # Custom routes must be deleted before the network can be deleted
             # ========================================================
-            logger.info("=== STEP 10: Discovering Networks ===")
+            logger.info("=== STEP 10: Discovering Routes ===")
+            try:
+                all_routes = []
+                page_token = None
+
+                while True:
+                    params = {}
+                    if page_token:
+                        params["pageToken"] = page_token
+
+                    response = compute_client.request(
+                        "GET",
+                        "projects/{}/global/routes".format(project_id),
+                        params=params,
+                    )
+
+                    items = response.get("items", [])
+                    all_routes.extend(items)
+
+                    page_token = response.get("nextPageToken")
+                    if not page_token:
+                        break
+
+                logger.info("Routes discovered | Count=%d", len(all_routes))
+
+                deleted_routes = []
+                for route in all_routes:
+                    route_name = route.get("name")
+                    if not route_name:
+                        continue
+
+                    # Skip default routes (they start with "default-route-" or are named "default-route")
+                    # These are automatically managed by GCP
+                    if route_name.startswith("default-route-") or route_name == "default-route":
+                        logger.info("Skipping default route: %s (managed by GCP)", route_name)
+                        continue
+
+                    try:
+                        delete_response = compute_client.request(
+                            "DELETE",
+                            "projects/{}/global/routes/{}".format(project_id, route_name),
+                            params={"requestId": str(uuid.uuid4())},
+                        )
+                        
+                        # Wait for the operation to complete
+                        operation_name = delete_response.get("name")
+                        if operation_name:
+                            max_wait_time = 30
+                            poll_interval = 2
+                            elapsed_time = 0
+                            
+                            while elapsed_time < max_wait_time:
+                                try:
+                                    operation_status = compute_client.request(
+                                        "GET",
+                                        "projects/{}/global/operations/{}".format(project_id, operation_name),
+                                    )
+                                    
+                                    if operation_status.get("status") == "DONE":
+                                        if "error" in operation_status:
+                                            error_obj = operation_status["error"]
+                                            errors = error_obj.get("errors", [])
+                                            error_messages = [err.get("message", str(err)) for err in errors]
+                                            raise GCPAPIError("; ".join(error_messages))
+                                        break
+                                    
+                                    time.sleep(poll_interval)
+                                    elapsed_time += poll_interval
+                                except GCPAPIError:
+                                    raise
+                        
+                        deleted_routes.append(route_name)
+                        logger.info("Route deleted: %s", route_name)
+                    except GCPAPIError as e:
+                        deleted_resources["failed_deletions"].append({
+                            "resource_type": "Route",
+                            "resource_name": route_name,
+                            "error": str(e)
+                        })
+                        logger.warning("Route deletion failed for %s: %s", route_name, str(e))
+
+                if deleted_routes:
+                    logger.info("Custom routes deleted | Count=%d", len(deleted_routes))
+                    time.sleep(10)
+
+            except GCPAPIError as e:
+                logger.error("List Routes failed: %s", str(e))
+            except Exception as e:
+                logger.error("Routes processing failed: %s", str(e), exc_info=True)
+
+            # ========================================================
+            # STEP 11: Delete Networks (including default)
+            # Note: Deleting a network automatically deletes its default routes and auto-mode subnetworks
+            # ========================================================
+            logger.info("=== STEP 11: Discovering Networks ===")
             try:
                 all_networks = []
                 page_token = None
@@ -710,13 +805,73 @@ def terminate_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
                         continue
 
                     try:
-                        compute_client.request(
+                        # Initiate network deletion
+                        delete_response = compute_client.request(
                             "DELETE",
                             "projects/{}/global/networks/{}".format(project_id, network_name),
                             params={"requestId": str(uuid.uuid4())},
                         )
-                        deleted_resources["deleted_networks"].append(network_name)
-                        logger.info("Network deleted: %s", network_name)
+                        
+                        # Wait for the operation to complete
+                        operation_name = delete_response.get("name")
+                        if operation_name:
+                            logger.info("Waiting for network deletion operation: %s", operation_name)
+                            
+                            # Poll the operation status (max 60 seconds)
+                            max_wait_time = 60
+                            poll_interval = 2
+                            elapsed_time = 0
+                            operation_done = False
+                            operation_error = None
+                            
+                            while elapsed_time < max_wait_time:
+                                try:
+                                    operation_status = compute_client.request(
+                                        "GET",
+                                        "projects/{}/global/operations/{}".format(project_id, operation_name),
+                                    )
+                                    
+                                    status = operation_status.get("status")
+                                    if status == "DONE":
+                                        operation_done = True
+                                        # Check for errors in the operation
+                                        if "error" in operation_status:
+                                            error_obj = operation_status["error"]
+                                            errors = error_obj.get("errors", [])
+                                            if errors:
+                                                error_messages = [err.get("message", str(err)) for err in errors]
+                                                operation_error = "; ".join(error_messages)
+                                        break
+                                    
+                                    time.sleep(poll_interval)
+                                    elapsed_time += poll_interval
+                                    
+                                except GCPAPIError as poll_error:
+                                    logger.warning("Error polling operation status: %s", str(poll_error))
+                                    break
+                            
+                            if not operation_done:
+                                logger.warning("Network deletion operation timed out after %ds: %s", max_wait_time, network_name)
+                                deleted_resources["failed_deletions"].append({
+                                    "resource_type": "VPC Network",
+                                    "resource_name": network_name,
+                                    "error": "Operation timed out after {}s".format(max_wait_time)
+                                })
+                            elif operation_error:
+                                logger.error("VPC Network deletion failed for %s: %s", network_name, operation_error)
+                                deleted_resources["failed_deletions"].append({
+                                    "resource_type": "VPC Network",
+                                    "resource_name": network_name,
+                                    "error": operation_error
+                                })
+                            else:
+                                deleted_resources["deleted_networks"].append(network_name)
+                                logger.info("Network deleted successfully: %s", network_name)
+                        else:
+                            # No operation returned, assume immediate success (unlikely for DELETE)
+                            deleted_resources["deleted_networks"].append(network_name)
+                            logger.info("Network deleted: %s", network_name)
+                            
                     except GCPAPIError as e:
                         # Capture detailed error including which resource is blocking deletion
                         error_detail = str(e.message) if hasattr(e, 'message') else str(e)
@@ -728,10 +883,10 @@ def terminate_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
                         })
                         logger.error("VPC Network deletion failed for %s: %s", network_name, error_detail)
 
-                # Wait for network deletions to complete
+                # Additional wait for network deletions to fully propagate (including auto-subnets)
                 if deleted_resources["deleted_networks"]:
-                    logger.info("Waiting for 60s for VPC network deletions to complete (including auto-subnets)...")
-                    time.sleep(60)
+                    logger.info("Waiting for 15s for VPC network deletions to fully propagate...")
+                    time.sleep(15)
 
             except GCPAPIError as e:
                 logger.error("List Networks failed: %s", str(e))
@@ -739,13 +894,29 @@ def terminate_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
                 logger.error("Networks processing failed: %s", str(e), exc_info=True)
 
             # ========================================================
-            # STEP 11: Create New Default VPC
+            # STEP 12: Create Default VPC 
             # ========================================================
-            logger.info("=== STEP 11: Creating New Default Network ===")
+            logger.info("=== STEP 12: Create Default Network ===")
             default_vpc_created = False
             
-            # Only try to create default VPC if the old default was actually deleted
-            if "default" in deleted_resources["deleted_networks"]:
+            # Check if default network exists
+            default_exists = False
+            try:
+                compute_client.request(
+                    "GET",
+                    "projects/{}/global/networks/default".format(project_id),
+                )
+                default_exists = True
+                logger.info("Default VPC network already exists")
+            except GCPAPIError as e:
+                if e.status_code == 404:
+                    logger.info("Default VPC network does not exist, will create it")
+                    default_exists = False
+                else:
+                    logger.warning("Error checking default network existence: %s", str(e))
+            
+            # Create default VPC if it doesn't exist
+            if not default_exists:
                 try:
                     default_network_body = {
                         "name": "default",
@@ -753,45 +924,50 @@ def terminate_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
                         "description": "Default network for the project"
                     }
                     
-                    compute_client.request(
+                    create_response = compute_client.request(
                         "POST",
                         "projects/{}/global/networks".format(project_id),
                         json_body=default_network_body,
                     )
+                    
+                    # Wait for the creation operation to complete
+                    operation_name = create_response.get("name")
+                    if operation_name:
+                        logger.info("Waiting for default network creation operation: %s", operation_name)
+                        
+                        max_wait_time = 60
+                        poll_interval = 2
+                        elapsed_time = 0
+                        
+                        while elapsed_time < max_wait_time:
+                            try:
+                                operation_status = compute_client.request(
+                                    "GET",
+                                    "projects/{}/global/operations/{}".format(project_id, operation_name),
+                                )
+                                
+                                if operation_status.get("status") == "DONE":
+                                    if "error" in operation_status:
+                                        error_obj = operation_status["error"]
+                                        errors = error_obj.get("errors", [])
+                                        error_messages = [err.get("message", str(err)) for err in errors]
+                                        raise GCPAPIError("; ".join(error_messages))
+                                    break
+                                
+                                time.sleep(poll_interval)
+                                elapsed_time += poll_interval
+                            except GCPAPIError:
+                                raise
+                    
                     logger.info("New default VPC network created successfully")
                     default_vpc_created = True
                     
-                    # Wait for default network creation to complete
+                    # Wait for default network to fully propagate
                     time.sleep(15)
                     
                 except GCPAPIError as e:
                     if e.status_code == 409:
-                        logger.warning("Default network already exists (409 conflict). Retrying after additional wait...")
-                        # Wait longer and retry once
-                        time.sleep(30)
-                        try:
-                            compute_client.request(
-                                "POST",
-                                "projects/{}/global/networks".format(project_id),
-                                json_body=default_network_body,
-                            )
-                            logger.info("New default network created successfully on retry")
-                            default_vpc_created = True
-                        except GCPAPIError as retry_error:
-                            if retry_error.status_code == 409:
-                                logger.error("Default network creation failed: Network already exists after retry")
-                                deleted_resources["failed_deletions"].append({
-                                    "resource_type": "Default VPC Network Creation",
-                                    "resource_name": "default",
-                                    "error": "Network already exists (409 conflict) - subnet may still exist from previous deletion"
-                                })
-                            else:
-                                logger.error("Default network creation failed on retry: %s", str(retry_error))
-                                deleted_resources["failed_deletions"].append({
-                                    "resource_type": "Default VPC Network Creation",
-                                    "resource_name": "default",
-                                    "error": str(retry_error)
-                                })
+                        logger.warning("Default network already exists (409 conflict) - may have been created by another process")
                     else:
                         logger.error("Default network creation failed: %s", str(e))
                         deleted_resources["failed_deletions"].append({
@@ -806,8 +982,6 @@ def terminate_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
                         "resource_name": "default",
                         "error": str(e)
                     })
-            else:
-                logger.info("Default VPC was not deleted, skipping recreation")
 
             # ------------------------------------------------------------
             # Workflow completed successfully
