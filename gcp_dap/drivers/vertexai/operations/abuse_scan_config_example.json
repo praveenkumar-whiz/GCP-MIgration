@@ -1,0 +1,19 @@
+{
+  "project_id": "your-project-id",
+  "region": "us-central1",
+  "access_token": "your-gcp-access-token",
+  "rules": {
+    "max_instances": 5,
+    "allowed_machine_types": ["e2-micro", "n1-standard-1"],
+    "allowed_disk_types": ["pd-standard"],
+    "allowed_disk_size_gb": 100,
+    "token_limit": {
+      "time_period_in_mins": 5,
+      "allowed_token_limitation": 10000
+    },
+    "model_restriction": {
+      "time_period_in_mins": 5,
+      "allowed_model": ["gemini-2.5-flash", "gemini-2.5-pro"]
+    }
+  }
+}

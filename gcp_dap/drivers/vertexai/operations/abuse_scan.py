@@ -1,6 +1,8 @@
 import json
 import logging
 from typing import Any, Dict, List
+from datetime import datetime, timezone, timedelta
+from collections import defaultdict
 from execution_plane.platform.gcp.sdk.client import GCPAPIError, GCPClientFactory
 
 # -------------------------------------------------------------------
@@ -22,7 +24,15 @@ def abuse_scan_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
           "max_instances": <int>,
           "allowed_machine_types": ["e2-micro", "n1-standard-1"],
           "allowed_disk_types": ["pd-standard", "pd-ssd"],
-          "allowed_disk_size_gb": <int>
+          "allowed_disk_size_gb": <int>,
+          "token_limit": {
+              "time_period_in_mins": 5,
+              "allowed_token_limitation": 10000
+          },
+          "model_restriction": {
+              "time_period_in_mins": 5,
+              "allowed_model": ["gemini-2.5-flash", "gemini-2.5-pro"]
+          }
       }
     """
     action = "VM_ABUSE_SCAN"
@@ -92,18 +102,18 @@ def abuse_scan_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
                 "region": region,
             }
         
+        client_creds = {"access_token": access_token}
+        
         # -------------------------------------------------------------------
         # CLIENT CREATION
         # -------------------------------------------------------------------
         try:
             compute_client = GCPClientFactory.create(
                 service="compute",
-                creds={
-                    "access_token": access_token,
-                },
+                creds=client_creds,
             )
         except Exception as e:
-            logger.error("Client creation failed", exc_info=True)
+            logger.error("Compute client creation failed", exc_info=True)
             return {
                 "status": "FAILED",
                 "action": action,
@@ -116,6 +126,28 @@ def abuse_scan_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
         logger.info("Connected to Compute Engine | Project={} | Region={}".format(
             project_id, region
         ))
+        
+        # ----------------------------------------------------------------
+        # Client connection to GCP Cloud Monitoring Services
+        # ----------------------------------------------------------------
+        monitoring_client = None
+        if "token_limit" in rules or "model_restriction" in rules:
+            try:
+                monitoring_client = GCPClientFactory.create(
+                    "monitoring",
+                    creds=client_creds,
+                )
+                logger.info("Connected to Cloud Monitoring | Project={}".format(project_id))
+            except Exception as e:
+                logger.error("Monitoring client creation failed", exc_info=True)
+                return {
+                    "status": "FAILED",
+                    "action": action,
+                    "reason": "MonitoringClientCreationFailed",
+                    "error": str(e),
+                    "project_id": project_id,
+                    "region": region,
+                }
         
         # -------------------------------------------------------------------
         # LIST ALL INSTANCES (aggregated across all zones)
@@ -329,6 +361,170 @@ def abuse_scan_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
                                 )
                         except (ValueError, TypeError):
                             pass
+        
+        # -------------------------------------------------------------------
+        # Rule 6: Token Usage Limit Check
+        # -------------------------------------------------------------------
+        if "token_limit" in rules:
+            token_config = rules.get("token_limit")
+            if isinstance(token_config, dict):
+                time_period = token_config.get("time_period_in_mins")
+                allowed_limit = token_config.get("allowed_token_limitation")
+                
+                if time_period and allowed_limit:
+                    try:
+                        logger.info("Checking token usage | Period={}min | Limit={}".format(
+                            time_period, allowed_limit
+                        ))
+                        
+                        # Calculate time window
+                        now = datetime.now(timezone.utc)
+                        start = now - timedelta(minutes=time_period)
+                        
+                        # Query parameters
+                        params = {
+                            "filter": 'metric.type="aiplatform.googleapis.com/publisher/online_serving/token_count"',
+                            "interval.endTime": now.isoformat(),
+                            "interval.startTime": start.isoformat(),
+                        }
+                        
+                        # Query Cloud Monitoring API
+                        response = monitoring_client.request(
+                            "GET",
+                            "projects/{}/timeSeries".format(project_id),
+                            params=params,
+                        )
+                        
+                        # Aggregate token usage
+                        total_input = 0
+                        total_output = 0
+                        usage_by_model = defaultdict(lambda: {"input": 0, "output": 0})
+                        
+                        time_series_list = response.get("timeSeries", [])
+                        for series in time_series_list:
+                            model = series.get("resource", {}).get("labels", {}).get("model_user_id", "unknown")
+                            token_type = series.get("metric", {}).get("labels", {}).get("type", "unknown")
+                            
+                            # Sum all points - convert to int to handle string values
+                            points = series.get("points", [])
+                            total = 0
+                            for point in points:
+                                value = point.get("value", {}).get("int64Value", 0)
+                                try:
+                                    total += int(value) if value else 0
+                                except (ValueError, TypeError):
+                                    pass
+                            
+                            if token_type == "input":
+                                total_input += total
+                                usage_by_model[model]["input"] += total
+                            elif token_type == "output":
+                                total_output += total
+                                usage_by_model[model]["output"] += total
+                        
+                        total_tokens = total_input + total_output
+                        
+                        logger.info(
+                            "Token usage | Project={} | Period={}min | Total={} | Input={} | Output={} | Limit={}".format(
+                                project_id, time_period, total_tokens, total_input, total_output, allowed_limit
+                            )
+                        )
+                        
+                        if total_tokens > allowed_limit:
+                            abuse_message.append(
+                                "Project {} | Token usage {} exceeded limit {} in last {} minutes.".format(
+                                    project_id, total_tokens, allowed_limit, time_period
+                                )
+                            )
+                            logger.warning(
+                                "ABUSE DETECTED - Token limit exceeded | Project={} | Total={} | Limit={} | Period={}min".format(
+                                    project_id, total_tokens, allowed_limit, time_period
+                                )
+                            )
+                    
+                    except Exception as e:
+                        logger.error("Token usage check failed", exc_info=True)
+                        abuse_message.append(
+                            "Project {} | Token usage check failed: {}".format(project_id, str(e))
+                        )
+        
+        # -------------------------------------------------------------------
+        # Rule 7: Model Restriction Check
+        # -------------------------------------------------------------------
+        if "model_restriction" in rules:
+            model_config = rules.get("model_restriction")
+            if isinstance(model_config, dict):
+                time_period = model_config.get("time_period_in_mins")
+                allowed_models = model_config.get("allowed_model")
+                
+                if time_period and allowed_models and isinstance(allowed_models, list):
+                    try:
+                        logger.info("Checking model usage | Period={}min | AllowedModels={}".format(
+                            time_period, ", ".join(allowed_models)
+                        ))
+                        
+                        # Calculate time window
+                        now = datetime.now(timezone.utc)
+                        start = now - timedelta(minutes=time_period)
+                        
+                        # Query parameters
+                        params = {
+                            "filter": 'metric.type="aiplatform.googleapis.com/publisher/online_serving/token_count"',
+                            "interval.endTime": now.isoformat(),
+                            "interval.startTime": start.isoformat(),
+                        }
+                        
+                        # Query Cloud Monitoring API
+                        response = monitoring_client.request(
+                            "GET",
+                            "projects/{}/timeSeries".format(project_id),
+                            params=params,
+                        )
+                        
+                        # Collect all used models
+                        used_models = set()
+                        unauthorized_models = []
+                        allowed_models_set = set(allowed_models)
+                        
+                        time_series_list = response.get("timeSeries", [])
+                        for series in time_series_list:
+                            model = series.get("resource", {}).get("labels", {}).get("model_user_id", "unknown")
+                            if model and model != "unknown":
+                                used_models.add(model)
+                                if model not in allowed_models_set:
+                                    unauthorized_models.append(model)
+                        
+                        unauthorized_models = list(set(unauthorized_models))  # Remove duplicates
+                        
+                        logger.info(
+                            "Model usage | Project={} | Period={}min | UsedModels={} | Unauthorized={} | Allowed={}".format(
+                                project_id, time_period, len(used_models), len(unauthorized_models), len(allowed_models)
+                            )
+                        )
+                        
+                        if unauthorized_models:
+                            abuse_message.append(
+                                "Project {} | Unauthorized models used: {} (allowed: {}) in last {} minutes.".format(
+                                    project_id,
+                                    ", ".join(unauthorized_models),
+                                    ", ".join(allowed_models),
+                                    time_period
+                                )
+                            )
+                            logger.warning(
+                                "ABUSE DETECTED - Unauthorized models | Project={} | Unauthorized={} | Allowed={} | Period={}min".format(
+                                    project_id,
+                                    ", ".join(unauthorized_models),
+                                    ", ".join(allowed_models),
+                                    time_period
+                                )
+                            )
+                    
+                    except Exception as e:
+                        logger.error("Model usage check failed", exc_info=True)
+                        abuse_message.append(
+                            "Project {} | Model usage check failed: {}".format(project_id, str(e))
+                        )
         
         # -------------------------------------------------------------------
         # RESPONSE DATA
