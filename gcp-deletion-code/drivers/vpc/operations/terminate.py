@@ -963,7 +963,7 @@ def terminate_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
                     default_vpc_created = True
                     
                     # Wait for default network to fully propagate
-                    time.sleep(15)
+                    time.sleep(5)
                     
                 except GCPAPIError as e:
                     if e.status_code == 409:
