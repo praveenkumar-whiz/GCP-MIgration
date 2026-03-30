@@ -1,0 +1,850 @@
+import json
+import logging
+import time
+import uuid
+from typing import Any, Dict
+from execution_plane.platform.gcp.sdk.client import GCPAPIError, GCPClientFactory
+
+# -------------------------------------------------------------------
+# Logger configuration
+# -------------------------------------------------------------------
+logger = logging.getLogger("gcp-vpc-terminate")
+logger.setLevel(logging.INFO)
+
+
+# -------------------------------------------------------------------
+# GCP VPC Network Deletion Function
+# -------------------------------------------------------------------
+def terminate_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Worker-only GCP VPC Network cleanup routine.
+    This is intentionally synchronous and long-running, executed by worker pod.
+
+    Expected spec keys:
+    - project_id (required)
+    - region_name / region (required)
+    - gcp_access_token / access_token (required)
+    """
+    cleanup_event = spec
+    logger.info("GCP VPC Network Deletion triggered")
+    logger.info("Incoming event: %s", json.dumps(cleanup_event))
+
+    # Support both 'region' and 'region_name' keys
+    region = cleanup_event.get("region_name") or cleanup_event.get("region")
+    if not region:
+        return {
+            "status": "FAILED",
+            "action": "VPC_NETWORK_TERMINATION",
+            "reason": "MissingRegion",
+        }
+
+    # Support both single region string and multiple regions list
+    regions = [region] if isinstance(region, str) else region
+    
+    # Ensure regions is a list
+    if not isinstance(regions, list) or not regions:
+        return {
+            "status": "FAILED",
+            "action": "VPC_NETWORK_TERMINATION",
+            "reason": "InvalidRegionFormat"
+        }
+
+    results = []
+    project_id = cleanup_event.get("project_id")
+
+    # Credentials are assumed upstream; use them for all GCP clients in this run
+    client_creds = {
+        "access_token": (
+            cleanup_event.get("gcp_access_token")
+            or cleanup_event.get("access_token")
+            or cleanup_event.get("google_access_token")
+        ),
+        "timeout": int(cleanup_event.get("timeout") or 30),
+    }
+
+    for region in regions:
+        deleted_resources = {
+            "deleted_addresses": [],
+            "deleted_global_addresses": [],
+            "deleted_packet_mirrorings": [],
+            "deleted_vpn_tunnels": [],
+            "deleted_vpn_gateways": [],
+            "deleted_target_vpn_gateways": [],
+            "deleted_network_attachments": [],
+            "deleted_firewalls": [],
+            "deleted_forwarding_rules": [],
+            "deleted_subnetworks": [],
+            "deleted_networks": [],
+            "total_addresses": 0,
+            "total_global_addresses": 0,
+            "total_packet_mirrorings": 0,
+            "total_vpn_tunnels": 0,
+            "total_vpn_gateways": 0,
+            "total_target_vpn_gateways": 0,
+            "total_network_attachments": 0,
+            "total_firewalls": 0,
+            "total_forwarding_rules": 0,
+            "total_subnetworks": 0,
+            "total_networks": 0,
+            "failed_deletions": [],
+        }
+
+        try:
+            # ----------------------------------------------------------------
+            # Client connection to GCP Compute Service
+            # ----------------------------------------------------------------
+            compute_client = GCPClientFactory.create(
+                "compute",
+                creds=client_creds,
+            )
+
+            logger.info("Connected to GCP Compute service | Project=%s | Region=%s", project_id, region)
+
+        logger.info("=== GCP VPC NETWORK FULL CLEANUP STARTED | Project=%s | Region=%s ===", project_id, region)
+
+        # ========================================================
+        # STEP 1: Delete Regional IP Addresses
+        # ========================================================
+        logger.info("=== STEP 1: Discovering Regional IP Addresses ===")
+        try:
+            all_addresses = []
+            page_token = None
+
+            while True:
+                params = {}
+                if page_token:
+                    params["pageToken"] = page_token
+
+                response = compute_client.request(
+                    "GET",
+                    "projects/{}/regions/{}/addresses".format(project_id, region),
+                    params=params,
+                )
+
+                items = response.get("items", [])
+                all_addresses.extend(items)
+
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    break
+
+            deleted_resources["total_addresses"] = len(all_addresses)
+            logger.info("Regional IP Addresses discovered | Count=%d", len(all_addresses))
+
+            for address in all_addresses:
+                address_name = address.get("name")
+                if not address_name:
+                    continue
+
+                try:
+                    compute_client.request(
+                        "DELETE",
+                        "projects/{}/regions/{}/addresses/{}".format(project_id, region, address_name),
+                        params={"requestId": str(uuid.uuid4())},
+                    )
+                    deleted_resources["deleted_addresses"].append(address_name)
+                    logger.info("Regional IP Address deleted: %s", address_name)
+                except GCPAPIError as e:
+                    deleted_resources["failed_deletions"].append({
+                        "resource_type": "Regional IP Address",
+                        "resource_name": address_name,
+                        "region": region,
+                        "error": str(e)
+                    })
+                    logger.warning("Regional IP Address deletion failed for %s: %s", address_name, str(e))
+
+        except GCPAPIError as e:
+            logger.error("List Regional IP Addresses failed: %s", str(e))
+        except Exception as e:
+            logger.error("Regional IP Addresses processing failed: %s", str(e), exc_info=True)
+
+        # ========================================================
+        # STEP 2: Delete Global IP Addresses
+        # ========================================================
+        logger.info("=== STEP 2: Discovering Global IP Addresses ===")
+        try:
+            all_global_addresses = []
+            page_token = None
+
+            while True:
+                params = {}
+                if page_token:
+                    params["pageToken"] = page_token
+
+                response = compute_client.request(
+                    "GET",
+                    "projects/{}/global/addresses".format(project_id),
+                    params=params,
+                )
+
+                items = response.get("items", [])
+                all_global_addresses.extend(items)
+
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    break
+
+            deleted_resources["total_global_addresses"] = len(all_global_addresses)
+            logger.info("Global IP Addresses discovered | Count=%d", len(all_global_addresses))
+
+            for address in all_global_addresses:
+                address_name = address.get("name")
+                if not address_name:
+                    continue
+
+                try:
+                    compute_client.request(
+                        "DELETE",
+                        "projects/{}/global/addresses/{}".format(project_id, address_name),
+                        params={"requestId": str(uuid.uuid4())},
+                    )
+                    deleted_resources["deleted_global_addresses"].append(address_name)
+                    logger.info("Global IP Address deleted: %s", address_name)
+                except GCPAPIError as e:
+                    deleted_resources["failed_deletions"].append({
+                        "resource_type": "Global IP Address",
+                        "resource_name": address_name,
+                        "error": str(e)
+                    })
+                    logger.warning("Global IP Address deletion failed for %s: %s", address_name, str(e))
+
+        except GCPAPIError as e:
+            logger.error("List Global IP Addresses failed: %s", str(e))
+        except Exception as e:
+            logger.error("Global IP Addresses processing failed: %s", str(e), exc_info=True)
+
+        # ========================================================
+        # STEP 3: Delete Packet Mirrorings
+        # ========================================================
+        logger.info("=== STEP 3: Discovering Packet Mirrorings ===")
+        try:
+            all_packet_mirrorings = []
+            page_token = None
+
+            while True:
+                params = {}
+                if page_token:
+                    params["pageToken"] = page_token
+
+                response = compute_client.request(
+                    "GET",
+                    "projects/{}/regions/{}/packetMirrorings".format(project_id, region),
+                    params=params,
+                )
+
+                items = response.get("items", [])
+                all_packet_mirrorings.extend(items)
+
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    break
+
+            deleted_resources["total_packet_mirrorings"] = len(all_packet_mirrorings)
+            logger.info("Packet Mirrorings discovered | Count=%d", len(all_packet_mirrorings))
+
+            for packet_mirroring in all_packet_mirrorings:
+                packet_mirroring_name = packet_mirroring.get("name")
+                if not packet_mirroring_name:
+                    continue
+
+                try:
+                    compute_client.request(
+                        "DELETE",
+                        "projects/{}/regions/{}/packetMirrorings/{}".format(project_id, region, packet_mirroring_name),
+                        params={"requestId": str(uuid.uuid4())},
+                    )
+                    deleted_resources["deleted_packet_mirrorings"].append(packet_mirroring_name)
+                    logger.info("Packet Mirroring deleted: %s", packet_mirroring_name)
+                except GCPAPIError as e:
+                    deleted_resources["failed_deletions"].append({
+                        "resource_type": "Packet Mirroring",
+                        "resource_name": packet_mirroring_name,
+                        "region": region,
+                        "error": str(e)
+                    })
+                    logger.warning("Packet Mirroring deletion failed for %s: %s", packet_mirroring_name, str(e))
+
+        except GCPAPIError as e:
+            logger.error("List Packet Mirrorings failed: %s", str(e))
+        except Exception as e:
+            logger.error("Packet Mirrorings processing failed: %s", str(e), exc_info=True)
+
+        # ========================================================
+        # STEP 4: Delete VPN Tunnels
+        # ========================================================
+        logger.info("=== STEP 4: Discovering VPN Tunnels ===")
+        try:
+            all_vpn_tunnels = []
+            page_token = None
+
+            while True:
+                params = {}
+                if page_token:
+                    params["pageToken"] = page_token
+
+                response = compute_client.request(
+                    "GET",
+                    "projects/{}/regions/{}/vpnTunnels".format(project_id, region),
+                    params=params,
+                )
+
+                items = response.get("items", [])
+                all_vpn_tunnels.extend(items)
+
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    break
+
+            deleted_resources["total_vpn_tunnels"] = len(all_vpn_tunnels)
+            logger.info("VPN Tunnels discovered | Count=%d", len(all_vpn_tunnels))
+
+            for vpn_tunnel in all_vpn_tunnels:
+                vpn_tunnel_name = vpn_tunnel.get("name")
+                if not vpn_tunnel_name:
+                    continue
+
+                try:
+                    compute_client.request(
+                        "DELETE",
+                        "projects/{}/regions/{}/vpnTunnels/{}".format(project_id, region, vpn_tunnel_name),
+                        params={"requestId": str(uuid.uuid4())},
+                    )
+                    deleted_resources["deleted_vpn_tunnels"].append(vpn_tunnel_name)
+                    logger.info("VPN Tunnel deleted: %s", vpn_tunnel_name)
+                except GCPAPIError as e:
+                    deleted_resources["failed_deletions"].append({
+                        "resource_type": "VPN Tunnel",
+                        "resource_name": vpn_tunnel_name,
+                        "region": region,
+                        "error": str(e)
+                    })
+                    logger.warning("VPN Tunnel deletion failed for %s: %s", vpn_tunnel_name, str(e))
+
+        except GCPAPIError as e:
+            logger.error("List VPN Tunnels failed: %s", str(e))
+        except Exception as e:
+            logger.error("VPN Tunnels processing failed: %s", str(e), exc_info=True)
+
+        # ========================================================
+        # STEP 5: Delete VPN Gateways
+        # ========================================================
+        logger.info("=== STEP 5: Discovering VPN Gateways ===")
+        try:
+            all_vpn_gateways = []
+            page_token = None
+
+            while True:
+                params = {}
+                if page_token:
+                    params["pageToken"] = page_token
+
+                response = compute_client.request(
+                    "GET",
+                    "projects/{}/regions/{}/vpnGateways".format(project_id, region),
+                    params=params,
+                )
+
+                items = response.get("items", [])
+                all_vpn_gateways.extend(items)
+
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    break
+
+            deleted_resources["total_vpn_gateways"] = len(all_vpn_gateways)
+            logger.info("VPN Gateways discovered | Count=%d", len(all_vpn_gateways))
+
+            for vpn_gateway in all_vpn_gateways:
+                vpn_gateway_name = vpn_gateway.get("name")
+                if not vpn_gateway_name:
+                    continue
+
+                try:
+                    compute_client.request(
+                        "DELETE",
+                        "projects/{}/regions/{}/vpnGateways/{}".format(project_id, region, vpn_gateway_name),
+                        params={"requestId": str(uuid.uuid4())},
+                    )
+                    deleted_resources["deleted_vpn_gateways"].append(vpn_gateway_name)
+                    logger.info("VPN Gateway deleted: %s", vpn_gateway_name)
+                except GCPAPIError as e:
+                    deleted_resources["failed_deletions"].append({
+                        "resource_type": "VPN Gateway",
+                        "resource_name": vpn_gateway_name,
+                        "region": region,
+                        "error": str(e)
+                    })
+                    logger.warning("VPN Gateway deletion failed for %s: %s", vpn_gateway_name, str(e))
+
+        except GCPAPIError as e:
+            logger.error("List VPN Gateways failed: %s", str(e))
+        except Exception as e:
+            logger.error("VPN Gateways processing failed: %s", str(e), exc_info=True)
+
+        # ========================================================
+        # STEP 6: Delete Target VPN Gateways
+        # ========================================================
+        logger.info("=== STEP 6: Discovering Target VPN Gateways ===")
+        try:
+            all_target_vpn_gateways = []
+            page_token = None
+
+            while True:
+                params = {}
+                if page_token:
+                    params["pageToken"] = page_token
+
+                response = compute_client.request(
+                    "GET",
+                    "projects/{}/regions/{}/targetVpnGateways".format(project_id, region),
+                    params=params,
+                )
+
+                items = response.get("items", [])
+                all_target_vpn_gateways.extend(items)
+
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    break
+
+            deleted_resources["total_target_vpn_gateways"] = len(all_target_vpn_gateways)
+            logger.info("Target VPN Gateways discovered | Count=%d", len(all_target_vpn_gateways))
+
+            for target_vpn_gateway in all_target_vpn_gateways:
+                target_vpn_gateway_name = target_vpn_gateway.get("name")
+                if not target_vpn_gateway_name:
+                    continue
+
+                try:
+                    compute_client.request(
+                        "DELETE",
+                        "projects/{}/regions/{}/targetVpnGateways/{}".format(project_id, region, target_vpn_gateway_name),
+                        params={"requestId": str(uuid.uuid4())},
+                    )
+                    deleted_resources["deleted_target_vpn_gateways"].append(target_vpn_gateway_name)
+                    logger.info("Target VPN Gateway deleted: %s", target_vpn_gateway_name)
+                except GCPAPIError as e:
+                    deleted_resources["failed_deletions"].append({
+                        "resource_type": "Target VPN Gateway",
+                        "resource_name": target_vpn_gateway_name,
+                        "region": region,
+                        "error": str(e)
+                    })
+                    logger.warning("Target VPN Gateway deletion failed for %s: %s", target_vpn_gateway_name, str(e))
+
+        except GCPAPIError as e:
+            logger.error("List Target VPN Gateways failed: %s", str(e))
+        except Exception as e:
+            logger.error("Target VPN Gateways processing failed: %s", str(e), exc_info=True)
+
+        # ========================================================
+        # STEP 7: Delete Network Attachments
+        # ========================================================
+        logger.info("=== STEP 7: Discovering Network Attachments ===")
+        try:
+            all_network_attachments = []
+            page_token = None
+
+            while True:
+                params = {}
+                if page_token:
+                    params["pageToken"] = page_token
+
+                response = compute_client.request(
+                    "GET",
+                    "projects/{}/regions/{}/networkAttachments".format(project_id, region),
+                    params=params,
+                )
+
+                items = response.get("items", [])
+                all_network_attachments.extend(items)
+
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    break
+
+            deleted_resources["total_network_attachments"] = len(all_network_attachments)
+            logger.info("Network Attachments discovered | Count=%d", len(all_network_attachments))
+
+            for network_attachment in all_network_attachments:
+                network_attachment_name = network_attachment.get("name")
+                if not network_attachment_name:
+                    continue
+
+                try:
+                    compute_client.request(
+                        "DELETE",
+                        "projects/{}/regions/{}/networkAttachments/{}".format(project_id, region, network_attachment_name),
+                        params={"requestId": str(uuid.uuid4())},
+                    )
+                    deleted_resources["deleted_network_attachments"].append(network_attachment_name)
+                    logger.info("Network Attachment deleted: %s", network_attachment_name)
+                except GCPAPIError as e:
+                    deleted_resources["failed_deletions"].append({
+                        "resource_type": "Network Attachment",
+                        "resource_name": network_attachment_name,
+                        "region": region,
+                        "error": str(e)
+                    })
+                    logger.warning("Network Attachment deletion failed for %s: %s", network_attachment_name, str(e))
+
+        except GCPAPIError as e:
+            logger.error("List Network Attachments failed: %s", str(e))
+        except Exception as e:
+            logger.error("Network Attachments processing failed: %s", str(e), exc_info=True)
+
+        # ========================================================
+        # STEP 8: Delete Firewall Rules (skip default-*)
+        # ========================================================
+        logger.info("=== STEP 8: Discovering Firewall Rules ===")
+        try:
+            all_firewalls = []
+            page_token = None
+
+            while True:
+                params = {}
+                if page_token:
+                    params["pageToken"] = page_token
+
+                response = compute_client.request(
+                    "GET",
+                    "projects/{}/global/firewalls".format(project_id),
+                    params=params,
+                )
+
+                items = response.get("items", [])
+                all_firewalls.extend(items)
+
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    break
+
+            deleted_resources["total_firewalls"] = len(all_firewalls)
+            logger.info("Firewall Rules discovered | Count=%d", len(all_firewalls))
+
+            for firewall in all_firewalls:
+                firewall_name = firewall.get("name")
+                if not firewall_name:
+                    continue
+
+                # Skip default firewall rules
+                if firewall_name.startswith("default-"):
+                    logger.info("Skipping default firewall rule: %s", firewall_name)
+                    continue
+
+                try:
+                    compute_client.request(
+                        "DELETE",
+                        "projects/{}/global/firewalls/{}".format(project_id, firewall_name),
+                        params={"requestId": str(uuid.uuid4())},
+                    )
+                    deleted_resources["deleted_firewalls"].append(firewall_name)
+                    logger.info("Firewall Rule deleted: %s", firewall_name)
+                except GCPAPIError as e:
+                    deleted_resources["failed_deletions"].append({
+                        "resource_type": "Firewall Rule",
+                        "resource_name": firewall_name,
+                        "error": str(e)
+                    })
+                    logger.warning("Firewall Rule deletion failed for %s: %s", firewall_name, str(e))
+
+        except GCPAPIError as e:
+            logger.error("List Firewall Rules failed: %s", str(e))
+        except Exception as e:
+            logger.error("Firewall Rules processing failed: %s", str(e), exc_info=True)
+
+        # ========================================================
+        # STEP 9: Delete Subnetworks (only custom/non-auto subnetworks)
+        # Note: Auto-mode subnetworks and routes will be deleted automatically with the network
+        # ========================================================
+        logger.info("=== STEP 9: Discovering Subnetworks ===")
+        try:
+            all_subnetworks = []
+            page_token = None
+
+            while True:
+                params = {}
+                if page_token:
+                    params["pageToken"] = page_token
+
+                response = compute_client.request(
+                    "GET",
+                    "projects/{}/regions/{}/subnetworks".format(project_id, region),
+                    params=params,
+                )
+
+                items = response.get("items", [])
+                all_subnetworks.extend(items)
+
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    break
+
+            deleted_resources["total_subnetworks"] = len(all_subnetworks)
+            logger.info("Subnetworks discovered | Count=%d", len(all_subnetworks))
+
+            for subnetwork in all_subnetworks:
+                subnetwork_name = subnetwork.get("name")
+                if not subnetwork_name:
+                    continue
+
+                # Check if subnetwork is used by load balancer (REGIONAL_MANAGED_PROXY)
+                if subnetwork.get("purpose") == "REGIONAL_MANAGED_PROXY":
+                    logger.info("Subnetwork %s is REGIONAL_MANAGED_PROXY, checking forwarding rules...", subnetwork_name)
+                    
+                    # Delete associated forwarding rules
+                    try:
+                        fr_page_token = None
+                        while True:
+                            fr_params = {}
+                            if fr_page_token:
+                                fr_params["pageToken"] = fr_page_token
+
+                            fr_response = compute_client.request(
+                                "GET",
+                                "projects/{}/regions/{}/forwardingRules".format(project_id, region),
+                                params=fr_params,
+                            )
+
+                            fr_items = fr_response.get("items", [])
+                            for forwarding_rule in fr_items:
+                                forwarding_rule_name = forwarding_rule.get("name")
+                                if not forwarding_rule_name:
+                                    continue
+
+                                try:
+                                    compute_client.request(
+                                        "DELETE",
+                                        "projects/{}/regions/{}/forwardingRules/{}".format(project_id, region, forwarding_rule_name),
+                                        params={"requestId": str(uuid.uuid4())},
+                                    )
+                                    deleted_resources["deleted_forwarding_rules"].append(forwarding_rule_name)
+                                    logger.info("Forwarding Rule deleted: %s", forwarding_rule_name)
+                                except GCPAPIError as e:
+                                    deleted_resources["failed_deletions"].append({
+                                        "resource_type": "Forwarding Rule",
+                                        "resource_name": forwarding_rule_name,
+                                        "region": region,
+                                        "error": str(e)
+                                    })
+                                    logger.warning("Forwarding Rule deletion failed for %s: %s", forwarding_rule_name, str(e))
+
+                            fr_page_token = fr_response.get("nextPageToken")
+                            if not fr_page_token:
+                                break
+
+                    except GCPAPIError as e:
+                        logger.warning("List Forwarding Rules failed: %s", str(e))
+
+                # Try to delete subnetwork (will fail for auto-mode subnets, which is expected)
+                try:
+                    compute_client.request(
+                        "DELETE",
+                        "projects/{}/regions/{}/subnetworks/{}".format(project_id, region, subnetwork_name),
+                        params={"requestId": str(uuid.uuid4())},
+                    )
+                    deleted_resources["deleted_subnetworks"].append(subnetwork_name)
+                    logger.info("Subnetwork deleted: %s", subnetwork_name)
+                except GCPAPIError as e:
+                    # Auto-mode subnetworks cannot be deleted individually - they'll be deleted with the network
+                    if "auto subnetwork" in str(e.message).lower() or "auto subnet mode" in str(e.message).lower():
+                        logger.info("Skipping auto-mode subnetwork %s (will be deleted with network)", subnetwork_name)
+                    else:
+                        deleted_resources["failed_deletions"].append({
+                            "resource_type": "Subnetwork",
+                            "resource_name": subnetwork_name,
+                            "region": region,
+                            "error": str(e)
+                        })
+                        logger.warning("Subnetwork deletion failed for %s: %s", subnetwork_name, str(e))
+
+            # Wait for custom subnetwork deletions to complete
+            if deleted_resources["deleted_subnetworks"]:
+                logger.info("Waiting for subnetwork deletions to complete...")
+                time.sleep(20)
+
+        except GCPAPIError as e:
+            logger.error("List Subnetworks failed: %s", str(e))
+        except Exception as e:
+            logger.error("Subnetworks processing failed: %s", str(e), exc_info=True)
+
+        # ========================================================
+        # STEP 10: Delete Networks (including default)
+        # Note: Deleting a network automatically deletes its routes and auto-mode subnetworks
+        # ========================================================
+        logger.info("=== STEP 10: Discovering Networks ===")
+        try:
+            all_networks = []
+            page_token = None
+
+            while True:
+                params = {}
+                if page_token:
+                    params["pageToken"] = page_token
+
+                response = compute_client.request(
+                    "GET",
+                    "projects/{}/global/networks".format(project_id),
+                    params=params,
+                )
+
+                items = response.get("items", [])
+                all_networks.extend(items)
+
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    break
+
+            deleted_resources["total_networks"] = len(all_networks)
+            logger.info("Networks discovered | Count=%d", len(all_networks))
+
+            for network in all_networks:
+                network_name = network.get("name")
+                if not network_name:
+                    continue
+
+                try:
+                    compute_client.request(
+                        "DELETE",
+                        "projects/{}/global/networks/{}".format(project_id, network_name),
+                        params={"requestId": str(uuid.uuid4())},
+                    )
+                    deleted_resources["deleted_networks"].append(network_name)
+                    logger.info("Network deleted: %s", network_name)
+                except GCPAPIError as e:
+                    deleted_resources["failed_deletions"].append({
+                        "resource_type": "VPC Network",
+                        "resource_name": network_name,
+                        "error": str(e)
+                    })
+                    logger.warning("VPC Network deletion failed for %s: %s", network_name, str(e))
+
+            # Wait for network deletions to complete
+            if deleted_resources["deleted_networks"]:
+                logger.info("Waiting for 45s VPC network deletions to complete...")
+                time.sleep(45)
+
+        except GCPAPIError as e:
+            logger.error("List Networks failed: %s", str(e))
+        except Exception as e:
+            logger.error("Networks processing failed: %s", str(e), exc_info=True)
+
+        # ========================================================
+        # STEP 11: Create New Default VPC
+        # ========================================================
+        logger.info("=== STEP 11: Creating New Default Network ===")
+        try:
+            default_network_body = {
+                "name": "default",
+                "autoCreateSubnetworks": True,
+                "description": "Default network for the project"
+            }
+            
+            compute_client.request(
+                "POST",
+                "projects/{}/global/networks".format(project_id),
+                json_body=default_network_body,
+            )
+            logger.info("New default VPC network created successfully")
+            
+            # Wait for default network creation to complete
+            time.sleep(15)
+            
+        except GCPAPIError as e:
+            if e.status_code == 409:
+                # Check if the old default VPC was actually deleted
+                if "default" not in deleted_resources["deleted_networks"]:
+                    logger.error("Default network creation failed: Old default VPC was not deleted")
+                    raise GCPAPIError(
+                        message="Cannot create new default VPC because old default VPC was not deleted",
+                        status_code=409,
+                        payload={"error": "Old default VPC still exists"}
+                    )
+                
+                logger.warning("Default network already exists (409 conflict). Retrying after additional wait...")
+                # Wait longer and retry once
+                time.sleep(20)
+                try:
+                    compute_client.request(
+                        "POST",
+                        "projects/{}/global/networks".format(project_id),
+                        json_body=default_network_body,
+                    )
+                    logger.info("New default network created successfully on retry")
+                except GCPAPIError as retry_error:
+                    if retry_error.status_code == 409:
+                        logger.info("Default network already exists after retry, skipping creation")
+                    else:
+                        logger.error("Default network creation failed on retry: %s", str(retry_error))
+                        raise
+            else:
+                logger.error("Default network creation failed: %s", str(e))
+                raise
+        except Exception as e:
+            logger.error("Default network creation failed: %s", str(e), exc_info=True)
+            raise
+
+        # ------------------------------------------------------------
+        # Workflow completed successfully
+        # ------------------------------------------------------------
+        logger.info("GCP VPC Network cleanup COMPLETED | Project=%s | Region=%s | "
+                   "Addresses=%d | GlobalAddresses=%d | PacketMirrorings=%d | "
+                   "VPNTunnels=%d | VPNGateways=%d | TargetVPNGateways=%d | "
+                   "NetworkAttachments=%d | Firewalls=%d | ForwardingRules=%d | "
+                   "Subnetworks=%d | Networks=%d",
+                   project_id, region,
+                   len(deleted_resources["deleted_addresses"]),
+                   len(deleted_resources["deleted_global_addresses"]),
+                   len(deleted_resources["deleted_packet_mirrorings"]),
+                   len(deleted_resources["deleted_vpn_tunnels"]),
+                   len(deleted_resources["deleted_vpn_gateways"]),
+                   len(deleted_resources["deleted_target_vpn_gateways"]),
+                   len(deleted_resources["deleted_network_attachments"]),
+                   len(deleted_resources["deleted_firewalls"]),
+                   len(deleted_resources["deleted_forwarding_rules"]),
+                   len(deleted_resources["deleted_subnetworks"]),
+                   len(deleted_resources["deleted_networks"]))
+
+        # Check if there were any failed deletions
+        if len(deleted_resources["failed_deletions"]) > 0:
+            logger.error("Deletion completed with failures | FailedResources=%d", len(deleted_resources["failed_deletions"]))
+            results.append({
+                "status": "FAILED",
+                "action": "VPC_NETWORK_TERMINATION",
+                "reason": "PartialDeletionFailure",
+                "project_id": project_id,
+                "region": region,
+                "data": deleted_resources
+            })
+        else:
+            results.append({
+                "status": "SUCCESS",
+                "action": "VPC_NETWORK_TERMINATION",
+                "project_id": project_id,
+                "region": region,
+                "data": deleted_resources
+            })
+
+        except GCPAPIError as e:
+            logger.error("GCP API Error during VPC Network deletion", exc_info=True)
+            results.append({
+                "status": "FAILED",
+                "action": "VPC_NETWORK_TERMINATION",
+                "reason": "GCPAPIError",
+                "project_id": project_id,
+                "region": region,
+                "detail": str(e.message),
+                "http_status": e.status_code,
+            })
+        except Exception as e:
+            logger.error("Unhandled exception during VPC Network deletion", exc_info=True)
+            results.append({
+                "status": "FAILED",
+                "action": "VPC_NETWORK_TERMINATION",
+                "reason": "UnhandledException",
+                "project_id": project_id,
+                "region": region,
+                "detail": str(e),
+            })
+
+    return results

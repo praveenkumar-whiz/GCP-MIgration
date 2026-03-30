@@ -1,0 +1,15 @@
+{
+
+"rules":{
+        "allowed_user_domains": ["@whizlabs.com", "@example.com"],
+        "forbidden_roles": ["roles/owner","roles/editer"]
+
+    }
+
+
+
+
+
+    
+
+}

@@ -1,0 +1,8 @@
+# Ignore venu folder
+venu/
+
+# Common ignores (add more as needed)
+node_modules/
+.DS_Store
+.env
+*.log

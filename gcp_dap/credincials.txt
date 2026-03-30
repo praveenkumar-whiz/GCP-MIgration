@@ -1,0 +1,16 @@
+gcloud auth print-access-token
+
+or 
+gcloud auth application-default print-access-token
+
+# Create virtual environment
+python3.11 -m venv venv
+
+# Activate it
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+
+uvicorn main:app --reload --host 127.0.0.1 --port 8000
