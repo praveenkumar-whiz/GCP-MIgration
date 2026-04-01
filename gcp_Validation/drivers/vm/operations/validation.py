@@ -494,18 +494,20 @@ def validation_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
         # WEB CHECKS (per-instance HTTP probe, scan across all instances)
         # ================================================================
 
-        def _get_public_ip(inst: Dict[str, Any]):
-            for iface in inst.get("networkInterfaces", []):
-                for ac in iface.get("accessConfigs", []):
-                    if ac.get("natIP"):
-                        return ac["natIP"]
-            return None
-
         # Apache Web Server Installed
         if "install_apache_webserver" in rules:
             apache_found = False
             for inst in active_instances:
-                public_ip = _get_public_ip(inst)
+                # Get public IP inline
+                public_ip = None
+                for iface in inst.get("networkInterfaces", []):
+                    for ac in iface.get("accessConfigs", []):
+                        if ac.get("natIP"):
+                            public_ip = ac["natIP"]
+                            break
+                    if public_ip:
+                        break
+
                 if not public_ip or inst.get("status", "").upper() != "RUNNING":
                     continue
                 for path in ["/", "/index.html"]:
@@ -542,7 +544,16 @@ def validation_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
         if "check_vm_web_application_status" in rules:
             web_app_found = False
             for inst in active_instances:
-                public_ip = _get_public_ip(inst)
+                # Get public IP inline
+                public_ip = None
+                for iface in inst.get("networkInterfaces", []):
+                    for ac in iface.get("accessConfigs", []):
+                        if ac.get("natIP"):
+                            public_ip = ac["natIP"]
+                            break
+                    if public_ip:
+                        break
+
                 if not public_ip or inst.get("status", "").upper() != "RUNNING":
                     continue
                 for path in ["/", "/index.html"]:
@@ -567,6 +578,45 @@ def validation_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
                     else "Web application is reachable but should not be"
                 )
             logger.info("check_vm_web_application_status check: %s", passed)
+
+        # ================================================================
+        # Security Policy Created
+        # ================================================================
+        if "security_policy_created" in rules:
+            try:
+                security_policies = []
+                page_token_sp = None
+
+                while True:
+                    params = {}
+                    if page_token_sp:
+                        params["pageToken"] = page_token_sp
+
+                    sp_response = compute_client.request(
+                        "GET",
+                        "projects/{}/global/securityPolicies".format(project_id),
+                        params=params,
+                    )
+                    security_policies.extend(sp_response.get("items", []))
+
+                    page_token_sp = sp_response.get("nextPageToken")
+                    if not page_token_sp:
+                        break
+
+                logger.info("Found %s security policy(ies)", len(security_policies))
+                passed = (len(security_policies) > 0) == rules["security_policy_created"]
+                all_results["security_policy_created"] = passed
+                if not passed:
+                    all_failure_reasons["security_policy_created"] = (
+                        "Security policy not found"
+                        if rules["security_policy_created"]
+                        else "Security policy exists but should not"
+                    )
+                logger.info("security_policy_created check: %s", passed)
+            except Exception as e:
+                logger.warning("Failed to check security_policy_created: %s", e)
+                all_results["security_policy_created"] = False
+                all_failure_reasons["security_policy_created"] = "Security policy check error: {}".format(e)
 
         # ================================================================
         # FINAL DECISION

@@ -1,1 +1,0 @@
-# Cloud Logging driver module

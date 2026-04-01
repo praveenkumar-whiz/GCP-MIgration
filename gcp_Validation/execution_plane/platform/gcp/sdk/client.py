@@ -78,6 +78,7 @@ class GCPServiceClient:
         "pubsub": "https://pubsub.googleapis.com/v1",
         "composer": "https://composer.googleapis.com/v1",
         "eventarc": "https://eventarc.googleapis.com/v1",
+        "looker": "https://looker.googleapis.com/v1",
         
         # AI & ML
         "aiplatform": "https://aiplatform.googleapis.com/v1",
@@ -87,6 +88,7 @@ class GCPServiceClient:
         "speech": "https://speech.googleapis.com/v1",
         "language": "https://language.googleapis.com/v1",
         "notebooks": "https://notebooks.googleapis.com/v2",
+        "documentai": "https://documentai.googleapis.com/v1",
         
         # Security & Identity
         "iam": "https://iam.googleapis.com/v1",
