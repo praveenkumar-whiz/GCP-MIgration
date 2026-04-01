@@ -65,29 +65,53 @@ def validation_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
 
         # --------------------------------------------------
         # Collect Vertex AI Workbench Instances
-        # Query: projects/{project}/locations/{region}/instances
+        # Query: projects/{project}/locations/{zone}/instances
+        # Note: Workbench instances are zone-specific, not region-specific
         # --------------------------------------------------
         all_instances: List[Dict[str, Any]] = []
-        page_token = None
+        
+        # First, get all zones in the region using compute API
+        compute_client = GCPClientFactory.create(
+            "compute",
+            creds=client_creds,
+        )
+        
+        zones_response = compute_client.request(
+            "GET",
+            "projects/{}/zones".format(project_id),
+            params={"filter": "name:{}*".format(region)}
+        )
+        
+        zones = [zone["name"] for zone in zones_response.get("items", [])]
+        logger.info("Found %s zone(s) in region %s: %s", len(zones), region, zones)
+        
+        # Query each zone for instances
+        for zone in zones:
+            page_token = None
+            while True:
+                params = {"pageSize": 500}
+                if page_token:
+                    params["pageToken"] = page_token
 
-        # Query specific region only
-        while True:
-            params = {"pageSize": 500}
-            if page_token:
-                params["pageToken"] = page_token
+                try:
+                    response = notebooks_client.request(
+                        "GET",
+                        "projects/{}/locations/{}/instances".format(project_id, zone),
+                        params=params,
+                    )
+                    all_instances.extend(response.get("instances", []))
+                    
+                    page_token = response.get("nextPageToken")
+                    if not page_token:
+                        break
+                except GCPAPIError as e:
+                    # If zone doesn't have instances or API returns 404, continue
+                    if e.status_code in [404, 403]:
+                        logger.info("No instances found in zone %s or access denied", zone)
+                        break
+                    raise
 
-            response = notebooks_client.request(
-                "GET",
-                "projects/{}/locations/{}/instances".format(project_id, region),
-                params=params,
-            )
-            all_instances.extend(response.get("instances", []))
-
-            page_token = response.get("nextPageToken")
-            if not page_token:
-                break
-
-        logger.info("Found %s GCP Vertex AI Workbench instance(s)", len(all_instances))
+        logger.info("Found %s GCP Vertex AI Workbench instance(s) across all zones", len(all_instances))
 
         # --------------------------------------------------
         # All validation results and failure reasons collected here

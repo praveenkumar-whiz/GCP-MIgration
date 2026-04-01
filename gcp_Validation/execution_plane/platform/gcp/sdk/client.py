@@ -74,7 +74,9 @@ class GCPServiceClient:
         # Data Analytics
         "bigquery": "https://bigquery.googleapis.com/bigquery/v2",
         "dataflow": "https://dataflow.googleapis.com/v1b3",
+        "datapipelines": "https://datapipelines.googleapis.com/v1",
         "dataproc": "https://dataproc.googleapis.com/v1",
+        "datafusion": "https://datafusion.googleapis.com/v1",
         "pubsub": "https://pubsub.googleapis.com/v1",
         "composer": "https://composer.googleapis.com/v1",
         "eventarc": "https://eventarc.googleapis.com/v1",
