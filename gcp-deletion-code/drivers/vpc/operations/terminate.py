@@ -81,6 +81,8 @@ def terminate_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
             "deleted_forwarding_rules": [],
             "deleted_subnetworks": [],
             "deleted_networks": [],
+            "created_default_vpc": False,
+            "created_default_firewall": False,
             "total_addresses": 0,
             "total_global_addresses": 0,
             "total_packet_mirrorings": 0,
@@ -968,6 +970,7 @@ def terminate_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
                     
                     logger.info("New default VPC network created successfully")
                     default_vpc_created = True
+                    deleted_resources["created_default_vpc"] = True
                     
                     # Wait for default network to fully propagate
                     time.sleep(5)
@@ -975,6 +978,8 @@ def terminate_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
                 except GCPAPIError as e:
                     if e.status_code == 409:
                         logger.warning("Default network already exists (409 conflict) - may have been created by another process")
+                        default_vpc_created = True
+                        deleted_resources["created_default_vpc"] = True
                     else:
                         logger.error("Default network creation failed: %s", str(e))
                         deleted_resources["failed_deletions"].append({
@@ -989,6 +994,106 @@ def terminate_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
                         "resource_name": "default",
                         "error": str(e)
                     })
+
+            # ========================================================
+            # STEP 13: Create Allow-All Ingress Firewall Rule for Default VPC
+            # ========================================================
+            if default_vpc_created:
+                logger.info("=== STEP 13: Create Allow-All Ingress Firewall Rule ===")
+                
+                firewall_rule_name = "allow-all-ingress"
+                
+                # Check if firewall rule already exists
+                firewall_exists = False
+                try:
+                    compute_client.request(
+                        "GET",
+                        "projects/{}/global/firewalls/{}".format(project_id, firewall_rule_name),
+                    )
+                    firewall_exists = True
+                    logger.info("Firewall rule '%s' already exists", firewall_rule_name)
+                except GCPAPIError as e:
+                    if e.status_code == 404:
+                        logger.info("Firewall rule '%s' does not exist, will create it", firewall_rule_name)
+                        firewall_exists = False
+                    else:
+                        logger.warning("Error checking firewall rule existence: %s", str(e))
+                
+                # Create firewall rule if it doesn't exist
+                if not firewall_exists:
+                    try:
+                        firewall_rule_body = {
+                            "name": firewall_rule_name,
+                            "network": "projects/{}/global/networks/default".format(project_id),
+                            "direction": "INGRESS",
+                            "priority": 1000,
+                            "allowed": [
+                                {
+                                    "IPProtocol": "all"
+                                }
+                            ],
+                            "sourceRanges": ["0.0.0.0/0"],
+                            "description": "TEMP: allow all inbound traffic"
+                        }
+                        
+                        create_firewall_response = compute_client.request(
+                            "POST",
+                            "projects/{}/global/firewalls".format(project_id),
+                            json_body=firewall_rule_body,
+                        )
+                        
+                        # Wait for the creation operation to complete
+                        operation_name = create_firewall_response.get("name")
+                        if operation_name:
+                            logger.info("Waiting for firewall rule creation operation: %s", operation_name)
+                            
+                            max_wait_time = 10
+                            poll_interval = 2
+                            elapsed_time = 0
+                            
+                            while elapsed_time < max_wait_time:
+                                try:
+                                    operation_status = compute_client.request(
+                                        "GET",
+                                        "projects/{}/global/operations/{}".format(project_id, operation_name),
+                                    )
+                                    
+                                    if operation_status.get("status") == "DONE":
+                                        if "error" in operation_status:
+                                            error_obj = operation_status["error"]
+                                            errors = error_obj.get("errors", [])
+                                            error_messages = [err.get("message", str(err)) for err in errors]
+                                            raise GCPAPIError("; ".join(error_messages))
+                                        break
+                                    
+                                    time.sleep(poll_interval)
+                                    elapsed_time += poll_interval
+                                except GCPAPIError:
+                                    raise
+                        
+                        logger.info("Firewall rule '%s' created successfully on default VPC", firewall_rule_name)
+                        deleted_resources["created_default_firewall"] = True
+                        
+                    except GCPAPIError as e:
+                        if e.status_code == 409:
+                            logger.warning("Firewall rule '%s' already exists (409 conflict) - may have been created by another process", firewall_rule_name)
+                            deleted_resources["created_default_firewall"] = True
+                        else:
+                            logger.error("Firewall rule creation failed: %s", str(e))
+                            deleted_resources["failed_deletions"].append({
+                                "resource_type": "Default Firewall Rule Creation",
+                                "resource_name": firewall_rule_name,
+                                "error": str(e)
+                            })
+                    except Exception as e:
+                        logger.error("Firewall rule creation failed: %s", str(e), exc_info=True)
+                        deleted_resources["failed_deletions"].append({
+                            "resource_type": "Default Firewall Rule Creation",
+                            "resource_name": firewall_rule_name,
+                            "error": str(e)
+                        })
+                else:
+                    deleted_resources["created_default_firewall"] = True
 
             # ------------------------------------------------------------
             # Workflow completed successfully
